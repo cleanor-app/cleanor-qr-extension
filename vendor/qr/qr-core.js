@@ -429,6 +429,98 @@ function appendBits(bb, value, length) {
     bb.push(value >>> i & 1);
   }
 }
+/**
+ * QR has three modes for ordinary text, and byte mode is the most expensive of them. A digit
+ * costs 8 bits in byte mode and 3.33 in numeric mode, so encoding a phone number or an order
+ * reference as bytes spends two and a half times the space it needs and pushes the code into a
+ * bigger, denser version than it deserves: 17 digits filled version 1, where 41 of them fit.
+ *
+ * The charset below is fixed by the spec (uppercase only, and a handful of punctuation), and the
+ * index of each character IS its value. Nothing here is a choice.
+ */
+const ALPHANUMERIC_CHARSET = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ $%*+-./:';
+
+
+const MODE_INDICATOR = {
+  numeric: 0b0001,
+  alphanumeric: 0b0010,
+  byte: 0b0100,
+};
+
+/** Character-count bit widths, by mode and by version band (1-9, 10-26, 27-40). */
+const CHAR_COUNT_BITS = {
+  numeric: [10, 12, 14],
+  alphanumeric: [9, 11, 13],
+  byte: [8, 16, 16],
+};
+
+function charCountBits(mode, version) {
+  const band = version <= 9 ? 0 : version <= 26 ? 1 : 2;
+  return CHAR_COUNT_BITS[mode][band];
+}
+
+/** The cheapest mode that can represent the whole string. */
+function pickMode(text, bytes) {
+  // An empty payload stays in byte mode: it is what every previous version of this encoder
+  // produced, and there is nothing to save.
+  if (text.length === 0) {
+    return 'byte';
+  }
+  if (/^[0-9]+$/.test(text)) {
+    return 'numeric';
+  }
+  if ([...text].every((character) => ALPHANUMERIC_CHARSET.includes(character))) {
+    return 'alphanumeric';
+  }
+  // Any multi-byte character forces byte mode anyway, and utf8Bytes has already told us.
+  void bytes;
+  return 'byte';
+}
+
+/** Bits the payload itself occupies, before the mode indicator and the character count. */
+function segmentDataBits(mode, text, bytes) {
+  if (mode === 'numeric') {
+    const groups = Math.floor(text.length / 3);
+    const remainder = text.length % 3;
+    return groups * 10 + (remainder === 0 ? 0 : remainder === 1 ? 4 : 7);
+  }
+  if (mode === 'alphanumeric') {
+    const pairs = Math.floor(text.length / 2);
+    return pairs * 11 + (text.length % 2) * 6;
+  }
+  return bytes.length * 8;
+}
+
+function appendSegment(bb, mode, text, bytes) {
+  if (mode === 'numeric') {
+    // Three digits share ten bits, because 999 fits in ten. The tail of one or two digits gets
+    // four or seven, for the same reason.
+    for (let i = 0; i < text.length; i += 3) {
+      const chunk = text.slice(i, i + 3);
+      appendBits(bb, Number(chunk), chunk.length === 3 ? 10 : chunk.length === 2 ? 7 : 4);
+    }
+    return;
+  }
+
+  if (mode === 'alphanumeric') {
+    // Two characters share eleven bits, packed base-45.
+    for (let i = 0; i < text.length; i += 2) {
+      const first = ALPHANUMERIC_CHARSET.indexOf(text[i]);
+      if (i + 1 === text.length) {
+        appendBits(bb, first, 6);
+        return;
+      }
+      const second = ALPHANUMERIC_CHARSET.indexOf(text[i + 1]);
+      appendBits(bb, first * 45 + second, 11);
+    }
+    return;
+  }
+
+  for (const byte of bytes) {
+    appendBits(bb, byte, 8);
+  }
+}
+
 function utf8Bytes(text) {
   if (typeof TextEncoder !== "undefined") {
     return Array.from(new TextEncoder().encode(text));
@@ -737,11 +829,16 @@ function computePenaltyScore(grid) {
 }
 function encodeQr(text, ecc) {
   const bytes = utf8Bytes(text);
+  const mode = pickMode(text, bytes);
+  const dataBits = segmentDataBits(mode, text, bytes);
+  const charCount = mode === 'byte' ? bytes.length : text.length;
+
+  // The character-count field widens at version 10 and again at 27, so the payload can fit a
+  // version and then stop fitting it. Recomputing the header inside the loop is the whole point.
   let version = 1;
   for (; version <= 40; version++) {
     const capacityBits = getNumDataCodewords(version, ecc) * 8;
-    const ccBits = version <= 9 ? 8 : 16;
-    const usedBits = 4 + ccBits + bytes.length * 8;
+    const usedBits = 4 + charCountBits(mode, version) + dataBits;
     if (usedBits <= capacityBits) {
       break;
     }
@@ -749,12 +846,11 @@ function encodeQr(text, ecc) {
   if (version > 40) {
     throw new Error("This text is too long for a QR code. Shorten it and try again.");
   }
+
   const bb = [];
-  appendBits(bb, 4, 4);
-  appendBits(bb, bytes.length, version <= 9 ? 8 : 16);
-  for (const b of bytes) {
-    appendBits(bb, b, 8);
-  }
+  appendBits(bb, MODE_INDICATOR[mode], 4);
+  appendBits(bb, charCount, charCountBits(mode, version));
+  appendSegment(bb, mode, text, bytes);
   const dataCapacityBits = getNumDataCodewords(version, ecc) * 8;
   appendBits(bb, 0, Math.min(4, dataCapacityBits - bb.length));
   appendBits(bb, 0, (8 - bb.length % 8) % 8);
